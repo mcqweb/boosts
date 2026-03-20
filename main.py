@@ -183,6 +183,29 @@ def parse_args() -> argparse.Namespace:
         default="bookmakers.json",
         help="File path to save or load bookmaker mapping.",
     )
+    p.add_argument(
+        "--discord",
+        action="store_true",
+        help="Send Discord embeds for fixtures within --mins minutes of kick-off.",
+    )
+    p.add_argument(
+        "--mins",
+        type=int,
+        default=60,
+        metavar="MINS",
+        help="Minutes before kick-off window for Discord notifications (default: 60).",
+    )
+    p.add_argument(
+        "--config",
+        default="config.json",
+        help="Path to config.json containing Discord bot_token and channel_id (default: config.json).",
+    )
+    p.add_argument(
+        "--discord-state",
+        default="discord_state.json",
+        dest="discord_state",
+        help="State file used to track already-sent Discord notifications (default: discord_state.json).",
+    )
     return p.parse_args()
 
 
@@ -326,14 +349,22 @@ def run_once(args: argparse.Namespace) -> None:
         except Exception as e:
             logger.error("Failed to save text output: %s", e)
 
-    if args.output_json:
-        try:
-            hierarchy = build_boost_hierarchy(boosts)
-            with open(args.output_json, "w", encoding="utf-8") as f:
-                json.dump(hierarchy, f, indent=2, ensure_ascii=False)
-            print(f"\nHierarchical JSON saved to {args.output_json}")
-        except Exception as e:
-            logger.error("Failed to save JSON output: %s", e)
+    if args.output_json or args.discord:
+        hierarchy = build_boost_hierarchy(boosts)
+
+        if args.output_json:
+            try:
+                with open(args.output_json, "w", encoding="utf-8") as f:
+                    json.dump(hierarchy, f, indent=2, ensure_ascii=False)
+                print(f"\nHierarchical JSON saved to {args.output_json}")
+            except Exception as e:
+                logger.error("Failed to save JSON output: %s", e)
+
+        if args.discord:
+            from discord_notifier import load_discord_config, send_fixture_embeds
+            discord_cfg = load_discord_config(args.config)
+            sent = send_fixture_embeds(hierarchy, args.mins, discord_cfg, args.discord_state)
+            print(f"\nDiscord: {sent} embed(s) sent (window: {args.mins} min).")
 
 
 def main() -> None:

@@ -474,13 +474,21 @@ def merge_exchange_data(boosts: list[dict], exchange_items: list[dict]) -> list[
         if not matched_boosts:
             continue
 
+        exchange_name = item.get("exchange_name") or ""
+        direct_url = item.get("direct_url")
+        if exchange_name.lower() == "betdaq":
+            event_id = item.get("exchange_event_id")
+            if event_id:
+                direct_url = f"https://www.betdaq.com/exchange/enhanced-specials/{event_id}"
+
         ex_data = {
             "name": item.get("bet_description") or "",
-            "exchangeName": item.get("exchange_name"),
+            "event_name": item.get("event_name") or "",
+            "exchangeName": exchange_name,
             "back_odds": str(item.get("back_odds")) if item.get("back_odds") is not None else None,
             "lay_odds": str(item.get("lay_odds")) if item.get("lay_odds") is not None else None,
             "oddsUs": None,
-            "direct_url": item.get("direct_url"),
+            "direct_url": direct_url,
         }
 
         for b in matched_boosts:
