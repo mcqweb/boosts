@@ -1,0 +1,11 @@
+version: "3.9"
+services:
+  boosts:
+    build: .
+    container_name: boosts_scraper
+    restart: unless-stopped
+    volumes:
+      - .:/app
+    env_file:
+      - .env.example
+    command: sh -c "while true; do python main.py --discord --mins 75 --output-json /app/boosts_hierarchy.json --config /app/config.json --discord-state /app/discord_state.json; sleep 900; done"
