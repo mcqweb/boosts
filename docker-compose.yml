@@ -1,11 +1,14 @@
-version: "3.9"
 services:
   boosts:
     build: .
-    container_name: boosts_scraper
+    container_name: boosts
     restart: unless-stopped
     volumes:
       - .:/app
+      - /home/admin/docker/proxy_config:/proxy:ro
     env_file:
       - .env.example
+    environment:
+      PROXY_CONFIG_PATH: "/proxy/proxy_config.json"
+      LOG_LEVEL: INFO
     command: sh -c "while true; do python main.py --discord --mins 75 --output-json /app/boosts_hierarchy.json --config /app/config.json --discord-state /app/discord_state.json; sleep 900; done"

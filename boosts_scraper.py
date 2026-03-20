@@ -64,6 +64,51 @@ from logging_config import get_logger
 logger = get_logger("boosts_scraper")
 
 # ---------------------------------------------------------------------------
+# Proxy helpers
+# ---------------------------------------------------------------------------
+
+_PROXIES: dict | None = None
+
+
+def load_proxy_config(path: str | None = None) -> dict | None:
+    """
+    Load a requests-compatible proxy dict from a JSON config file.
+
+    Expected file format (same as used elsewhere in the project)::
+
+        {
+          "http":  "http://user:pass@host:port",
+          "https": "http://user:pass@host:port"
+        }
+
+    Falls back to PROXY_CONFIG_PATH env var if *path* is None.
+    Returns None when no config is found or the file is missing.
+    """
+    global _PROXIES
+    config_path = path or os.environ.get("PROXY_CONFIG_PATH")
+    if not config_path:
+        return None
+    if not os.path.isfile(config_path):
+        logger.warning("Proxy config not found at %s", config_path)
+        return None
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _PROXIES = data
+        logger.info("Proxy loaded from %s", config_path)
+        return data
+    except Exception as e:
+        logger.error("Failed to load proxy config from %s: %s", config_path, e)
+        return None
+
+
+# Auto-load on import if PROXY_CONFIG_PATH is set
+_auto_proxy_path = os.environ.get("PROXY_CONFIG_PATH")
+if _auto_proxy_path and os.path.isfile(_auto_proxy_path):
+    load_proxy_config(_auto_proxy_path)
+
+
+# ---------------------------------------------------------------------------
 # Cache helpers
 # ---------------------------------------------------------------------------
 
@@ -212,6 +257,9 @@ def _get(path: str, params: dict | None = None, cache_ttl: int | None = None) ->
             get_kwargs["timeout_seconds"] = REQUEST_TIMEOUT
         else:
             get_kwargs["timeout"] = REQUEST_TIMEOUT
+
+        if _PROXIES and not (tls_client and isinstance(session, tls_client.sessions.Session)):
+            get_kwargs["proxies"] = _PROXIES
 
         resp = session.get(url, **get_kwargs)
         logger.debug("Response %s from %s", resp.status_code, url)
@@ -412,7 +460,7 @@ def get_exchange_data(
 ) -> list[dict]:
     """Fetch enhanced exchange specials from oddsmatcha."""
     try:
-        resp = requests.get(url, timeout=timeout_seconds)
+        resp = requests.get(url, timeout=timeout_seconds, proxies=_PROXIES or None)
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, list):
