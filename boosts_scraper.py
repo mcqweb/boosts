@@ -406,6 +406,89 @@ def get_bookmakers(cache_ttl: int = 3600) -> list[dict]:
     return []
 
 
+def get_exchange_data(
+    url: str = "https://api.oddsmatcha.uk/enhanced_specials/?active_only=true&odds_drops_only=false",
+    timeout_seconds: int = 30,
+) -> list[dict]:
+    """Fetch enhanced exchange specials from oddsmatcha."""
+    try:
+        resp = requests.get(url, timeout=timeout_seconds)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and "results" in data and isinstance(data["results"], list):
+            return data["results"]
+    except Exception as e:
+        logger.warning("Failed to fetch exchange data: %s", e)
+    return []
+
+
+def _exchange_canonical_key(exchange_item: dict) -> str:
+    market_type = exchange_item.get("market_type") or ""
+    bet_description = exchange_item.get("bet_description") or ""
+    event_name = exchange_item.get("event_name") or ""
+
+    generic_markets = {"enhanced specials", "winner", "unknown", ""}
+
+    if market_type.strip().lower() in generic_markets:
+        candidate = _normalize_bet_name(bet_description)
+    else:
+        candidate = _normalize_bet_name(market_type)
+
+    if not candidate:
+        candidate = _normalize_bet_name(f"{event_name} {market_type} {bet_description}")
+
+    return _canonicalize_text(candidate)
+
+
+def _boost_canonical_bet_key(boost: dict) -> str:
+    betname = boost.get("betName") or boost.get("name") or boost.get("selectionName") or boost.get("outcome") or ""
+    return _canonicalize_text(_normalize_bet_name(betname))
+
+
+def merge_exchange_data(boosts: list[dict], exchange_items: list[dict]) -> list[dict]:
+    """Attach exchange info to matched boosts in-place."""
+    if not boosts or not exchange_items:
+        return boosts
+
+    boost_index: dict[str, list[dict]] = {}
+    for b in boosts:
+        key = _boost_canonical_bet_key(b)
+        if key:
+            boost_index.setdefault(key, []).append(b)
+
+    for item in exchange_items:
+        key = _exchange_canonical_key(item)
+        matched_boosts = boost_index.get(key, [])
+
+        if not matched_boosts:
+            # fallback: substring similarity for close text
+            ex_norm = key
+            for bkey, bvals in boost_index.items():
+                if not bkey:
+                    continue
+                if ex_norm in bkey or bkey in ex_norm:
+                    matched_boosts.extend(bvals)
+
+        if not matched_boosts:
+            continue
+
+        ex_data = {
+            "name": item.get("bet_description") or "",
+            "exchangeName": item.get("exchange_name"),
+            "back_odds": str(item.get("back_odds")) if item.get("back_odds") is not None else None,
+            "lay_odds": str(item.get("lay_odds")) if item.get("lay_odds") is not None else None,
+            "oddsUs": None,
+            "direct_url": item.get("direct_url"),
+        }
+
+        for b in matched_boosts:
+            b.setdefault("exchanges", []).append(ex_data)
+
+    return boosts
+
+
 def get_bookmaker_mapping_from_api(cache_ttl: int = 3600) -> dict[str, str]:
     """Fetch looking-glass bookmaker code->display-name mapping from OddsChecker."""
     raw = get_bookmakers(cache_ttl=cache_ttl)
@@ -550,6 +633,8 @@ def enrich_boosts_with_hierarchy(
         if sid and sid in subevent_map:
             se = subevent_map[sid]
             boost.setdefault("eventName", se.get("name") or se.get("eventName", ""))
+            boost.setdefault("eventId", se.get("eventId") or se.get("id") or boost.get("eventId"))
+            boost.setdefault("subeventId", se.get("subeventId") or se.get("id") or boost.get("subeventId"))
             boost.setdefault("startTime", se.get("startTime") or se.get("startDate", ""))
 
     return boosts
@@ -776,6 +861,10 @@ def _clean_bet_name_for_output(name: str) -> str:
     out = re.sub(r"\banytime\b", "", out, flags=re.I)
 
     out = re.sub(r"\s+", " ", out).strip()
+
+    # strip trailing punctuation and non-alphanumeric fragments left from cleanup
+    out = re.sub(r"[^A-Za-z0-9 ]+$", "", out).strip()
+
     return out
 
 
@@ -966,14 +1055,32 @@ def build_boost_hierarchy(boosts: list[dict]) -> dict:
             }
             normalized_bookmakers.append(normalized)
 
-        event_group = hierarchy.setdefault(event_name, {})
-        fixture_group = event_group.setdefault(fixture_name, [])
+        event_group = hierarchy.setdefault(event_name, [])
 
-        fixture_group.append({
+        fixture_block = next(
+            (f for f in event_group if f.get("fixture") == fixture_name),
+            None,
+        )
+
+        if not fixture_block:
+            fixture_block = {
+                "fixture": fixture_name,
+                "eventName": event_name,
+                "eventId": boost.get("eventId"),
+                "subeventId": boost.get("subeventId"),
+                "startTime": boost.get("startTime"),
+                "boosts": [],
+            }
+            event_group.append(fixture_block)
+
+        boost_entry: dict[str, Any] = {
             "name": bet_name,
             "market": market,
             "bookmakers": normalized_bookmakers,
-        })
+        }
+        if boost.get("exchanges"):
+            boost_entry["exchanges"] = boost["exchanges"]
+        fixture_block["boosts"].append(boost_entry)
 
     return hierarchy
 

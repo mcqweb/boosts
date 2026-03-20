@@ -147,8 +147,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output-json",
         metavar="FILE",
-        default=None,
+        default="boosts_hierarchy.json",
         help="Save event/fixture/bet/bookie hierarchy as JSON.",
+    )
+    p.add_argument(
+        "--no-exchange",
+        action="store_true",
+        dest="no_exchange",
+        help="Skip fetching exchange specials (exchange data is included by default).",
     )
     p.add_argument(
         "--filters",
@@ -280,6 +286,14 @@ def run_once(args: argparse.Namespace) -> None:
     if not args.no_dedupe:
         boosts = dedupe_boosts(boosts)
     after_dedupe = len(boosts)
+
+    if not args.no_exchange:
+        from boosts_scraper import get_exchange_data, merge_exchange_data
+
+        exchange_items = get_exchange_data()
+        if exchange_items:
+            boosts = merge_exchange_data(boosts, exchange_items)
+            print(f"\nMerged {len(exchange_items)} exchange item(s) into boosts\n")
 
     if args.no_dedupe:
         print(f"\nFound {after_dedupe} boost(s) (dedupe disabled).\n")
