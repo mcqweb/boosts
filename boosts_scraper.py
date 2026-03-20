@@ -406,6 +406,52 @@ def get_bookmakers(cache_ttl: int = 3600) -> list[dict]:
     return []
 
 
+def get_bookmaker_mapping_from_api(cache_ttl: int = 3600) -> dict[str, str]:
+    """Fetch looking-glass bookmaker code->display-name mapping from OddsChecker."""
+    raw = get_bookmakers(cache_ttl=cache_ttl)
+    mapping: dict[str, str] = {}
+
+    for m in raw or []:
+        code = m.get("code") or m.get("bookmakerCode") or m.get("id")
+        name = m.get("name") or m.get("bookmakerName")
+        if code and name:
+            mapping[str(code)] = str(name)
+
+    return mapping
+
+
+def save_bookmaker_mapping(mapping: dict[str, str], path: str = "bookmakers.json") -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(mapping, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("Failed to save bookmaker mapping to %s: %s", path, e)
+
+
+def load_bookmaker_mapping(path: str = "bookmakers.json") -> dict[str, str]:
+    if not os.path.isfile(path):
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): str(v) for k, v in data.items()}
+    except Exception as e:
+        logger.warning("Failed to load bookmaker mapping from %s: %s", path, e)
+
+    return {}
+
+
+def refresh_bookmaker_mapping(path: str = "bookmakers.json", cache_ttl: int = 3600) -> dict[str, str]:
+    """Fetch the latest bookmaker list and persist to a local mapping file."""
+    upstream = get_bookmaker_mapping_from_api(cache_ttl=cache_ttl)
+    final = {**BOOKMAKER_MAPPING, **upstream}
+
+    save_bookmaker_mapping(final, path)
+    return final
+
+
 def get_big_football_matches(size: int = 10, cache_ttl: int = 300) -> list[dict]:
     """Fetch upcoming high-profile football matches."""
     data = _get("/football/v1/big-matches", params={"size": str(size)}, cache_ttl=cache_ttl)
@@ -685,6 +731,16 @@ def _normalize_bet_name(name: str) -> str:
 
     t = name.strip().lower()
 
+    # remove parenthetical metadata (keep for bookmaker output only)
+    t = re.sub(r"\([^)]*\)", "", t)
+
+    # remove trailing/embedded "was <odds>" qualifiers
+    t = re.sub(r"\bwas\s+\d+(?:\.\d+)?(?:\/\d+)?\b", "", t)
+
+    # team synonyms to normalized key; carefully avoid Man City
+    t = re.sub(r"\bmanchester united\b|\bman utd\b|\bman united\b", "manunited", t)
+    t = re.sub(r"\bmanchester city\b|\bman city\b", "mancity", t)
+
     # player-specific aliases / common name abbreviations
     t = re.sub(r"\bmatheus\s+cunha\b", "cunha", t)
 
@@ -697,9 +753,6 @@ def _normalize_bet_name(name: str) -> str:
     t = re.sub(r"1\+", "over0p5", t)
     t = re.sub(r"\bover\s*0\.?5\b", "over0p5", t)
     t = re.sub(r"\b0\.5\b", "0p5", t)
-
-    # trim additional metadata like parenthetical phrases
-    t = re.sub(r"\([^)]*\)", "", t)
 
     return t
 
@@ -742,6 +795,8 @@ def dedupe_boosts(boosts: list[dict]) -> list[dict]:
         key = get_boost_canonic_key(boost)
 
         bookie_entry = {
+            "name": boost.get("betName") or boost.get("name") or boost.get("selectionName") or boost.get("outcome"),
+            "betName": boost.get("betName") or boost.get("name") or boost.get("selectionName") or boost.get("outcome"),
             "bookmakerCode": boost.get("bookmakerCode") or boost.get("bookie") or boost.get("bookmaker"),
             "bookmakerName": _bookie_name(boost.get("bookmakerCode") or boost.get("bookie") or boost.get("bookmaker", "?")),
             "odds": boost.get("odds") or boost.get("oddsDecimal") or boost.get("boostedOdds") or "",
@@ -807,6 +862,97 @@ def format_boosts_grouped_by_fixture(boosts: list[dict]) -> str:
         parts.append("")
 
     return "\n".join(parts).strip()
+
+
+def build_boost_hierarchy(boosts: list[dict]) -> dict:
+    """Build a nested event/fixture/bet hierarchy for JSON output."""
+    hierarchy: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+    for boost in boosts:
+        event_name = (
+            boost.get("eventName")
+            or boost.get("event")
+            or "Unknown event"
+        )
+        fixture_name = (
+            boost.get("subeventName")
+            or boost.get("eventName")
+            or boost.get("event")
+            or boost.get("matchName")
+            or "Unknown fixture"
+        )
+        bet_name = (
+            boost.get("betName")
+            or boost.get("name")
+            or boost.get("selectionName")
+            or boost.get("outcome")
+            or "Unknown bet"
+        )
+
+        market = (
+            boost.get("betTypeName")
+            or boost.get("marketName")
+            or boost.get("betType")
+            or ""
+        )
+
+        bookies_raw = boost.get("bookmakers")
+        if not bookies_raw:
+            bookie_code = boost.get("bookmakerCode") or boost.get("bookmaker") or boost.get("bookie")
+            bookies_raw = [
+                {
+                    "bookmakerCode": bookie_code,
+                    "bookmakerName": boost.get("bookmakerName"),
+                    "odds": [
+                        {
+                            "bookieCode": boost.get("bookieCode"),
+                            "oddsFractional": boost.get("oddsFractional"),
+                            "oddsDecimal": boost.get("odds") or boost.get("oddsDecimal") or boost.get("boostedOdds"),
+                            "oddsUs": boost.get("oddsUs"),
+                            "priceType": boost.get("priceType"),
+                            "bookmakerBetId": boost.get("bookmakerBetId"),
+                        }
+                    ]
+                }
+            ]
+
+        normalized_bookmakers = []
+        for b in bookies_raw:
+            odds = b.get("odds")
+            primary = None
+            if isinstance(odds, list) and odds:
+                first = odds[0]
+                if isinstance(first, dict):
+                    primary = first
+
+            bookmaker_code = b.get("bookmakerCode") or b.get("bookieCode") or (primary and primary.get("bookieCode"))
+            raw_bookmaker_name = b.get("bookmakerName") or b.get("bookmaker") or ""
+            normalized_bookmaker_name = (
+                raw_bookmaker_name
+                if raw_bookmaker_name and raw_bookmaker_name != "?"
+                else _bookie_name(bookmaker_code or "")
+            )
+            normalized = {
+                "name": b.get("name") or b.get("betName") or bet_name,
+                "bookmakerCode": bookmaker_code,
+                "bookmakerName": normalized_bookmaker_name,
+                "oddsFractional": (primary and primary.get("oddsFractional")) or b.get("oddsFractional"),
+                "oddsDecimal": (primary and primary.get("oddsDecimal")) or b.get("oddsDecimal") or b.get("odds"),
+                "oddsUs": (primary and primary.get("oddsUs")) or b.get("oddsUs"),
+                "priceType": (primary and primary.get("priceType")) or b.get("priceType"),
+                "bookmakerBetId": (primary and primary.get("bookmakerBetId")) or b.get("bookmakerBetId"),
+            }
+            normalized_bookmakers.append(normalized)
+
+        event_group = hierarchy.setdefault(event_name, {})
+        fixture_group = event_group.setdefault(fixture_name, [])
+
+        fixture_group.append({
+            "name": bet_name,
+            "market": market,
+            "bookmakers": normalized_bookmakers,
+        })
+
+    return hierarchy
 
 
 # ---------------------------------------------------------------------------

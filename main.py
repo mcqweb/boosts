@@ -47,6 +47,7 @@ except ImportError:
 from logging_config import get_logger
 from boosts_scraper import (
     apply_filters,
+    build_boost_hierarchy,
     dedupe_boosts,
     format_boosts,
     format_boosts_grouped_by_fixture,
@@ -144,6 +145,12 @@ def parse_args() -> argparse.Namespace:
         help="Save formatted boost list to a plaintext file.",
     )
     p.add_argument(
+        "--output-json",
+        metavar="FILE",
+        default=None,
+        help="Save event/fixture/bet/bookie hierarchy as JSON.",
+    )
+    p.add_argument(
         "--filters",
         metavar="FILE",
         default="filters.json",
@@ -159,6 +166,16 @@ def parse_args() -> argparse.Namespace:
         choices=["none", "fixture"],
         default="none",
         help="Group output by fixture (subevent/event).",
+    )
+    p.add_argument(
+        "--sync-bookies",
+        action="store_true",
+        help="Fetch bookmakers mapping from OddsChecker and save to bookmakers.json (for scheduled refresh).",
+    )
+    p.add_argument(
+        "--bookmaker-map",
+        default="bookmakers.json",
+        help="File path to save or load bookmaker mapping.",
     )
     return p.parse_args()
 
@@ -295,12 +312,28 @@ def run_once(args: argparse.Namespace) -> None:
         except Exception as e:
             logger.error("Failed to save text output: %s", e)
 
+    if args.output_json:
+        try:
+            hierarchy = build_boost_hierarchy(boosts)
+            with open(args.output_json, "w", encoding="utf-8") as f:
+                json.dump(hierarchy, f, indent=2, ensure_ascii=False)
+            print(f"\nHierarchical JSON saved to {args.output_json}")
+        except Exception as e:
+            logger.error("Failed to save JSON output: %s", e)
+
 
 def main() -> None:
     args = parse_args()
 
     if args.discover:
         run_discover()
+        return
+
+    if args.sync_bookies:
+        from boosts_scraper import refresh_bookmaker_mapping
+
+        saved = refresh_bookmaker_mapping(path=args.bookmaker_map)
+        print(f"Saved {len(saved)} bookmaker mappings to {args.bookmaker_map}")
         return
 
     if args.loop:
