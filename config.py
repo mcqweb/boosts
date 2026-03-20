@@ -19,7 +19,7 @@ OC_API_BASE = "https://api.oddschecker.com/api/mobile-app"
 # spoofing (tls_client) without an explicit key — the key is tried first when
 # present.
 # ---------------------------------------------------------------------------
-OC_API_KEY = os.getenv("OC_API_KEY", "a1d4634b-6cd8-4485-a7cd-c9b91f38177f")
+OC_API_KEY = os.getenv("OC_API_KEY") or "a1d4634b-6cd8-4485-a7cd-c9b91f38177f"
 
 # ---------------------------------------------------------------------------
 # Bet-type IDs for "boosted" / "enhanced-price" markets

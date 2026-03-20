@@ -11,4 +11,5 @@ services:
     environment:
       PROXY_CONFIG_PATH: "/proxy/proxy_config.json"
       LOG_LEVEL: INFO
+      OC_API_KEY: "a1d4634b-6cd8-4485-a7cd-c9b91f38177f"
     command: sh -c "while true; do python main.py --discord --mins 75 --output-json /app/boosts_hierarchy.json --config /app/config.json --discord-state /app/discord_state.json; sleep 900; done"

@@ -72,17 +72,10 @@ _PROXIES: dict | None = None
 
 def load_proxy_config(path: str | None = None) -> dict | None:
     """
-    Load a requests-compatible proxy dict from a JSON config file.
+    Load a requests-compatible proxy dict from the shared proxy_config.json.
 
-    Expected file format (same as used elsewhere in the project)::
-
-        {
-          "http":  "http://user:pass@host:port",
-          "https": "http://user:pass@host:port"
-        }
-
-    Falls back to PROXY_CONFIG_PATH env var if *path* is None.
-    Returns None when no config is found or the file is missing.
+    Resolves: arbs.oddschecker -> proxies.<key> -> build http/https proxy URL.
+    Returns None when no config is found or the entry is missing.
     """
     global _PROXIES
     config_path = path or os.environ.get("PROXY_CONFIG_PATH")
@@ -94,9 +87,30 @@ def load_proxy_config(path: str | None = None) -> dict | None:
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        _PROXIES = data
-        logger.info("Proxy loaded from %s", config_path)
-        return data
+
+        proxy_key = (data.get("arbs") or {}).get("oddschecker")
+        if not proxy_key:
+            logger.warning("No arbs.oddschecker entry in proxy config")
+            return None
+
+        proxy_def = (data.get("proxies") or {}).get(proxy_key)
+        if not proxy_def:
+            logger.warning("Proxy key '%s' not found in proxies section", proxy_key)
+            return None
+
+        host     = proxy_def["host"]
+        port     = proxy_def["port"]
+        username = proxy_def.get("username", "")
+        password = proxy_def.get("password", "")
+
+        if username and password:
+            proxy_url = f"http://{username}:{password}@{host}:{port}"
+        else:
+            proxy_url = f"http://{host}:{port}"
+
+        _PROXIES = {"http": proxy_url, "https": proxy_url}
+        logger.info("Proxy loaded from %s using '%s' (%s:%s)", config_path, proxy_key, host, port)
+        return _PROXIES
     except Exception as e:
         logger.error("Failed to load proxy config from %s: %s", config_path, e)
         return None
@@ -106,6 +120,15 @@ def load_proxy_config(path: str | None = None) -> dict | None:
 _auto_proxy_path = os.environ.get("PROXY_CONFIG_PATH")
 if _auto_proxy_path and os.path.isfile(_auto_proxy_path):
     load_proxy_config(_auto_proxy_path)
+else:
+    if _auto_proxy_path:
+        logger.warning("PROXY_CONFIG_PATH set to '%s' but file not found — running without proxy", _auto_proxy_path)
+    else:
+        logger.info("No PROXY_CONFIG_PATH set — running without proxy")
+
+# Log API key status at startup
+_key_preview = (OC_API_KEY or "")[:8]
+logger.info("API key: %s... (len=%d)", _key_preview, len(OC_API_KEY or ""))
 
 
 # ---------------------------------------------------------------------------
@@ -174,26 +197,36 @@ def _make_session():
     Return a session suitable for OddsChecker access.
 
     Preference order:
-      1) cloudscraper (recommended for Cloudflare mobile API)
-      2) tls_client  (fallback if cloudscraper not installed)
-      3) requests     (fallback; may be blocked by Cloudflare)
+      1) tls_client  (genuine Chrome TLS fingerprint, OS-independent — best for Cloudflare)
+      2) cloudscraper (fallback)
+      3) requests     (fallback; likely blocked by Cloudflare)
     """
-    if cloudscraper:
-        try:
-            return cloudscraper.create_scraper(
-                browser={"browser": "chrome", "platform": "windows", "mobile": False},
-            )
-        except Exception as e:
-            logger.warning("Could not create cloudscraper session: %s", e)
-
     if tls_client:
         try:
-            return tls_client.Session(
+            session = tls_client.Session(
                 client_identifier="chrome120",
                 random_tls_extension_order=True,
             )
+            proxy_host = (_PROXIES.get("https") or _PROXIES.get("http") or "").split("@")[-1] if _PROXIES else None
+            logger.info("Session: tls_client [proxy=%s]", proxy_host or "none")
+            return session
         except Exception as e:
             logger.warning("Could not create tls_client session: %s", e)
+
+    if cloudscraper:
+        try:
+            session = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False},
+            )
+            if _PROXIES:
+                session.proxies.update(_PROXIES)
+                proxy_host = (_PROXIES.get("https") or _PROXIES.get("http") or "").split("@")[-1]
+                logger.info("Session: cloudscraper [proxy=%s]", proxy_host)
+            else:
+                logger.info("Session: cloudscraper [no proxy]")
+            return session
+        except Exception as e:
+            logger.warning("Could not create cloudscraper session: %s", e)
 
     logger.warning("Using requests.Session fallback (may be blocked by Cloudflare)")
     return requests.Session()
@@ -255,12 +288,15 @@ def _get(path: str, params: dict | None = None, cache_ttl: int | None = None) ->
 
         if tls_client and isinstance(session, tls_client.sessions.Session):
             get_kwargs["timeout_seconds"] = REQUEST_TIMEOUT
+            if _PROXIES:
+                # tls_client takes a single proxy URL string via the proxy= kwarg
+                get_kwargs["proxy"] = _PROXIES.get("https") or _PROXIES.get("http")
         else:
             get_kwargs["timeout"] = REQUEST_TIMEOUT
+            if _PROXIES:
+                get_kwargs["proxies"] = _PROXIES
 
-        if _PROXIES and not (tls_client and isinstance(session, tls_client.sessions.Session)):
-            get_kwargs["proxies"] = _PROXIES
-
+        logger.info("GET %s [proxy=%s]", url, bool(_PROXIES))
         resp = session.get(url, **get_kwargs)
         logger.debug("Response %s from %s", resp.status_code, url)
 
@@ -274,7 +310,10 @@ def _get(path: str, params: dict | None = None, cache_ttl: int | None = None) ->
             return None
 
         if resp.status_code == 403:
-            logger.error("HTTP 403 from %s — access forbidden", url)
+            logger.error(
+                "HTTP 403 from %s — body: %s",
+                url, resp.text[:500].replace("\n", " "),
+            )
             return None
 
         if resp.status_code != 200:
