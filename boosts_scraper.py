@@ -734,6 +734,10 @@ def _normalize_bet_name(name: str) -> str:
     # remove parenthetical metadata (keep for bookmaker output only)
     t = re.sub(r"\([^)]*\)", "", t)
 
+    # normalize 'Anytime' to score and remove plain 'anytime'
+    t = re.sub(r"\bto\s+score\s+anytime\b", "to score", t)
+    t = re.sub(r"\banytime\b", "", t)
+
     # remove trailing/embedded "was <odds>" qualifiers
     t = re.sub(r"\bwas\s+\d+(?:\.\d+)?(?:\/\d+)?\b", "", t)
 
@@ -755,6 +759,24 @@ def _normalize_bet_name(name: str) -> str:
     t = re.sub(r"\b0\.5\b", "0p5", t)
 
     return t
+
+
+def _clean_bet_name_for_output(name: str) -> str:
+    """Return a cleaned human-friendly bet name for merged output."""
+    import re
+
+    if not name:
+        return ""
+
+    out = name.strip()
+
+    out = re.sub(r"\([^)]*\)", "", out)
+    out = re.sub(r"\bwas\s+\d+(?:/\d+)?\b", "", out, flags=re.I)
+    out = re.sub(r"\bto\s+score\s+anytime\b", "to score", out, flags=re.I)
+    out = re.sub(r"\banytime\b", "", out, flags=re.I)
+
+    out = re.sub(r"\s+", " ", out).strip()
+    return out
 
 
 def _canonicalize_text(text: str) -> str:
@@ -880,13 +902,14 @@ def build_boost_hierarchy(boosts: list[dict]) -> dict:
             or boost.get("matchName")
             or "Unknown fixture"
         )
-        bet_name = (
+        raw_bet_name = (
             boost.get("betName")
             or boost.get("name")
             or boost.get("selectionName")
             or boost.get("outcome")
             or "Unknown bet"
         )
+        bet_name = _clean_bet_name_for_output(raw_bet_name) or raw_bet_name
 
         market = (
             boost.get("betTypeName")
