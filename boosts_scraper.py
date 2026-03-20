@@ -603,9 +603,32 @@ def format_boost(boost: dict) -> str:
     Handles unknown field names gracefully so the code keeps working even
     when the actual API response has a different shape.
     """
-    # Try several common field names for each piece of data
-    bookie_raw = boost.get("bookmakerCode") or boost.get("bookmaker") or boost.get("bookie") or "?"
-    bookie = _bookie_name(bookie_raw)
+    bookies = boost.get("bookmakers")
+    if bookies and isinstance(bookies, list) and len(bookies) > 0:
+        # Keep full bookmaker metadata in text output for deduped entries.
+        bookmaker_entries = []
+        for b in bookies:
+            normalized = {
+                "bookmakerCode": b.get("bookmakerCode") or b.get("bookmaker") or b.get("bookie"),
+                "bookmakerName": b.get("bookmakerName") or _bookie_name(b.get("bookmakerCode") or b.get("bookmaker") or b.get("bookie") or ""),
+                "oddsFractional": b.get("oddsFractional"),
+                "oddsDecimal": b.get("odds") or b.get("oddsDecimal"),
+                "oddsUs": b.get("oddsUs"),
+                "priceType": b.get("priceType"),
+                "bookmakerBetId": b.get("bookmakerBetId"),
+            }
+            bookmaker_entries.append(normalized)
+
+        bookmaker_list_str = "[" + ", ".join(str(x) for x in bookmaker_entries) + "]"
+        bookie = ""  # no prefix in final output
+        boosted = ""
+        original = ""
+    else:
+        bookmaker_list_str = ""
+        bookie_raw = boost.get("bookmakerCode") or boost.get("bookmaker") or boost.get("bookie") or "?"
+        bookie = _bookie_name(bookie_raw)
+        boosted = boost.get("boostedOdds") or boost.get("odds") or boost.get("oddsDecimal") or ""
+        original = boost.get("originalOdds") or boost.get("referenceOdds") or ""
 
     bet_name = (
         boost.get("betName")
@@ -623,9 +646,6 @@ def format_boost(boost: dict) -> str:
         or ""
     )
 
-    boosted = boost.get("boostedOdds") or boost.get("odds") or boost.get("oddsDecimal") or ""
-    original = boost.get("originalOdds") or boost.get("referenceOdds") or ""
-
     odds_str = str(boosted)
     if original:
         odds_str += f" (was {original})"
@@ -637,7 +657,7 @@ def format_boost(boost: dict) -> str:
         or ""
     )
 
-    parts = [f"[{bookie}]"]
+    parts = []
     if subevent:
         parts.append(subevent)
     if event and event != subevent:
@@ -645,10 +665,109 @@ def format_boost(boost: dict) -> str:
     if market:
         parts.append(f"| {market}")
     parts.append(f"| {bet_name}")
-    if odds_str:
-        parts.append(f"@ {odds_str}")
+
+    if bookmaker_list_str:
+        # only include odds prefix when we want old style
+        parts.append(f"@ {bookmaker_list_str}")
+    else:
+        if odds_str:
+            parts.append(f"@ {odds_str}")
 
     return "  ".join(parts)
+
+
+def _normalize_bet_name(name: str) -> str:
+    """Normalize bet description tokens to canonical equivalents."""
+    import re
+
+    if not name:
+        return ""
+
+    t = name.strip().lower()
+
+    # player-specific aliases / common name abbreviations
+    t = re.sub(r"\bmatheus\s+cunha\b", "cunha", t)
+
+    # shot-on-target canonicalization
+    t = re.sub(r"\bplayer\s+shots\s+on\s+target\b", "shot on target", t)
+    t = re.sub(r"\bshots\s+on\s+target\b", "shot on target", t)
+    t = re.sub(r"\bshot\s+on\s+target\b", "shot on target", t)
+
+    # odds quantifiers equivalence (1+ vs over 0.5)
+    t = re.sub(r"1\+", "over0p5", t)
+    t = re.sub(r"\bover\s*0\.?5\b", "over0p5", t)
+    t = re.sub(r"\b0\.5\b", "0p5", t)
+
+    # trim additional metadata like parenthetical phrases
+    t = re.sub(r"\([^)]*\)", "", t)
+
+    return t
+
+
+def _canonicalize_text(text: str) -> str:
+    """Canonicalize text for deduping equivalent bets."""
+    import re
+
+    if not text:
+        return ""
+
+    t = text.strip().lower()
+    t = t.replace("&", "and")
+    t = re.sub(r"[^a-z0-9 ]+", " ", t)
+    t = re.sub(r"\s+", " ", t)
+
+    # remove filler words that produce near-equivalent outcomes
+    fillers = ["was", "and", "the", "to", "have", "a", "in", "on", "each"]
+    parts = sorted(set(w for w in t.split() if w not in fillers))
+    return " ".join(parts)
+
+
+def get_boost_canonic_key(boost: dict) -> str:
+    """Return a canonical key representing the core bet description."""
+    subevent = boost.get("subeventName", "")
+    betname = _normalize_bet_name(boost.get("betName", "") or "")
+    market = boost.get("marketName", "")
+
+    canon = _canonicalize_text(f"{subevent} {market} {betname}")
+    return canon
+
+
+def dedupe_boosts(boosts: list[dict]) -> list[dict]:
+    """Merge duplicate boosts across bookmakers into a canonical set."""
+    if not boosts:
+        return []
+
+    dedup = {}
+    for boost in boosts:
+        key = get_boost_canonic_key(boost)
+
+        bookie_entry = {
+            "bookmakerCode": boost.get("bookmakerCode") or boost.get("bookie") or boost.get("bookmaker"),
+            "bookmakerName": _bookie_name(boost.get("bookmakerCode") or boost.get("bookie") or boost.get("bookmaker", "?")),
+            "odds": boost.get("odds") or boost.get("oddsDecimal") or boost.get("boostedOdds") or "",
+            "oddsFractional": boost.get("oddsFractional"),
+            "oddsUs": boost.get("oddsUs"),
+            "priceType": boost.get("priceType"),
+            "bookmakerBetId": boost.get("bookmakerBetId"),
+        }
+
+        if key not in dedup:
+            dedup[key] = boost.copy()
+            dedup[key]["bookmakers"] = [bookie_entry]
+        else:
+            existing = dedup[key]
+            existing_bookmakers = existing.get("bookmakers") or []
+            existing_bookmakers.append(bookie_entry)
+            existing["bookmakers"] = existing_bookmakers
+
+    # Convert to list preserving original order by first appearance
+    result = []
+    for boost in boosts:
+        key = get_boost_canonic_key(boost)
+        if key in dedup:
+            result.append(dedup.pop(key))
+
+    return result
 
 
 def format_boosts(boosts: list[dict]) -> str:
@@ -657,6 +776,37 @@ def format_boosts(boosts: list[dict]) -> str:
         return "  (no boosts found)"
     lines = [format_boost(b) for b in boosts]
     return "\n".join(lines)
+
+
+def group_boosts_by_fixture(boosts: list[dict]) -> dict[str, list[dict]]:
+    """Group boosts by fixture (subeventName/eventName/matchName)."""
+    groups: dict[str, list[dict]] = {}
+    for boost in boosts:
+        fixture = (
+            boost.get("subeventName")
+            or boost.get("eventName")
+            or boost.get("event")
+            or boost.get("matchName")
+            or "Unknown fixture"
+        )
+        groups.setdefault(fixture, []).append(boost)
+    return groups
+
+
+def format_boosts_grouped_by_fixture(boosts: list[dict]) -> str:
+    """Return formatted grouped by fixture output."""
+    if not boosts:
+        return "  (no boosts found)"
+
+    groups = group_boosts_by_fixture(boosts)
+    parts: list[str] = []
+    for fixture_name in sorted(groups):
+        parts.append(f"{fixture_name}")
+        group_lines = ["  " + l for l in format_boosts(groups[fixture_name]).split("\n")]
+        parts.extend(group_lines)
+        parts.append("")
+
+    return "\n".join(parts).strip()
 
 
 # ---------------------------------------------------------------------------

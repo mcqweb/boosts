@@ -47,7 +47,9 @@ except ImportError:
 from logging_config import get_logger
 from boosts_scraper import (
     apply_filters,
+    dedupe_boosts,
     format_boosts,
+    format_boosts_grouped_by_fixture,
     get_all_boosts_paginated,
     get_big_football_matches,
     get_bookmakers,
@@ -146,6 +148,17 @@ def parse_args() -> argparse.Namespace:
         metavar="FILE",
         default="filters.json",
         help="Load JSON filters from this file and apply to output.",
+    )
+    p.add_argument(
+        "--no-dedupe",
+        action="store_true",
+        help="Skip canonical deduplication (show all source boosts).",
+    )
+    p.add_argument(
+        "--group-by",
+        choices=["none", "fixture"],
+        default="none",
+        help="Group output by fixture (subevent/event).",
     )
     return p.parse_args()
 
@@ -246,12 +259,24 @@ def run_once(args: argparse.Namespace) -> None:
     if filters:
         boosts = apply_filters(boosts, filters)
 
-    print(f"\nFound {len(boosts)} boost(s).\n")
+    before_dedupe = len(boosts)
+    if not args.no_dedupe:
+        boosts = dedupe_boosts(boosts)
+    after_dedupe = len(boosts)
+
+    if args.no_dedupe:
+        print(f"\nFound {after_dedupe} boost(s) (dedupe disabled).\n")
+    else:
+        print(f"\nFound {before_dedupe} boost(s) before dedupe, {after_dedupe} after dedupe.\n")
 
     if args.raw:
         print(json.dumps(boosts, indent=2, ensure_ascii=False))
     else:
-        print(format_boosts(boosts))
+        if args.group_by == "fixture":
+            output = format_boosts_grouped_by_fixture(boosts)
+        else:
+            output = format_boosts(boosts)
+        print(output)
 
     if args.output:
         try:
@@ -263,7 +288,7 @@ def run_once(args: argparse.Namespace) -> None:
 
     if args.output_txt:
         try:
-            formatted = format_boosts(boosts)
+            formatted = output if not args.raw else json.dumps(boosts, indent=2, ensure_ascii=False)
             with open(args.output_txt, "w", encoding="utf-8") as f:
                 f.write(formatted)
             print(f"\nFormatted text saved to {args.output_txt}")
