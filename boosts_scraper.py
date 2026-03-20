@@ -1,0 +1,742 @@
+"""
+boosts_scraper.py
+=================
+Fetches "betting boosts" (enhanced / boosted prices) from the OddsChecker
+mobile API.
+
+Key public API
+--------------
+  get_boosts(...)          - fetch raw boost bets from /v1/bets-search
+  get_subevents_hierarchy(...) - fetch event tree from /v1/subevents-hierarchy
+  get_categories()         - fetch all sport categories
+  get_bookmakers()         - fetch all bookmaker definitions
+  get_big_football_matches() - upcoming high-profile football matches
+  get_horse_racing_next_off() - next horse-racing events
+  format_boosts(boosts)    - pretty-print a list of boost dicts
+  run_boost_loop(...)      - continually poll and display new boosts
+
+Authentication
+--------------
+The OddsChecker mobile API lives at api.oddschecker.com and uses TLS
+fingerprinting (same Cloudflare protection as the main site).  We use
+tls_client with a Chrome fingerprint, exactly as the web-scraping code does.
+
+If an OC_API_KEY environment variable is set it will be forwarded as an
+``X-Api-Key`` header (optional — most endpoints work without it when the
+correct TLS fingerprint is presented).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from typing import Any
+
+try:
+    import cloudscraper
+except ImportError:
+    cloudscraper = None  # type: ignore
+
+try:
+    import tls_client
+except ImportError:
+    tls_client = None  # type: ignore
+
+import requests
+
+from config import (
+    ALL_BOOST_BET_TYPE_IDS,
+    BOOKMAKER_MAPPING,
+    BOOST_BET_TYPE_IDS_FOOTBALL,
+    CACHE_DIR,
+    CACHE_TTL_BOOSTS,
+    CATEGORY_GROUP_FOOTBALL,
+    DEFAULT_BOOKMAKER_CODES,
+    DEFAULT_MINIMUM_ODDS,
+    DEFAULT_PAGE_SIZE,
+    OC_API_BASE,
+    OC_API_KEY,
+    REQUEST_TIMEOUT,
+)
+from logging_config import get_logger
+
+logger = get_logger("boosts_scraper")
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+_BOOSTS_CACHE_DIR = os.path.join(CACHE_DIR, "boosts")
+
+
+def _ensure_cache() -> None:
+    os.makedirs(_BOOSTS_CACHE_DIR, exist_ok=True)
+
+
+def _cache_path(key: str) -> str:
+    # Remove characters that are invalid in Windows filenames and reduce length
+    safe = key.replace("/", "_")
+    safe = safe.replace("\\", "_")
+    safe = safe.replace(":", "_")
+    safe = safe.replace("*", "_")
+    safe = safe.replace("?", "_")
+    safe = safe.replace('"', "_")
+    safe = safe.replace("<", "_")
+    safe = safe.replace(">", "_")
+    safe = safe.replace("|", "_")
+    safe = safe.replace("&", "_")
+    safe = safe.replace("=", "_")
+    safe = safe.replace(" ", "_")
+
+    # Prevent too-long names; use hash suffix if needed
+    if len(safe) > 180:
+        import hashlib
+        h = hashlib.sha256(safe.encode("utf-8")).hexdigest()
+        safe = safe[:100] + "_" + h
+
+    return os.path.join(_BOOSTS_CACHE_DIR, f"{safe}.json")
+
+
+def _read_cache(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _write_cache(path: str, data) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning("Cache write failed %s: %s", path, e)
+
+
+def _cache_valid(path: str, ttl: int) -> bool:
+    if not os.path.exists(path):
+        return False
+    return (time.time() - os.path.getmtime(path)) < ttl
+
+
+# ---------------------------------------------------------------------------
+# Session factory
+# ---------------------------------------------------------------------------
+
+def _make_session():
+    """
+    Return a session suitable for OddsChecker access.
+
+    Preference order:
+      1) cloudscraper (recommended for Cloudflare mobile API)
+      2) tls_client  (fallback if cloudscraper not installed)
+      3) requests     (fallback; may be blocked by Cloudflare)
+    """
+    if cloudscraper:
+        try:
+            return cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False},
+            )
+        except Exception as e:
+            logger.warning("Could not create cloudscraper session: %s", e)
+
+    if tls_client:
+        try:
+            return tls_client.Session(
+                client_identifier="chrome120",
+                random_tls_extension_order=True,
+            )
+        except Exception as e:
+            logger.warning("Could not create tls_client session: %s", e)
+
+    logger.warning("Using requests.Session fallback (may be blocked by Cloudflare)")
+    return requests.Session()
+
+
+def _base_headers() -> dict[str, str]:
+    """Common headers for all mobile-API requests."""
+    headers = {
+        "Content-Type": "application/json",
+        "App-Type": "mapp",
+        "Accept": "application/json",
+        "Userbookmakers": ",".join(DEFAULT_BOOKMAKER_CODES[:1]) if DEFAULT_BOOKMAKER_CODES else "B3",
+        "Device-Id": "32568159-9874-6184-B9E0-A21CADB4EB84",
+        "Api-Key": OC_API_KEY or "",
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "User-Agent": "Oddschecker/28716 CFNetwork/3826.500.111.2.2 Darwin/24.4.0",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    return headers
+
+
+# ---------------------------------------------------------------------------
+# Core GET helper
+# ---------------------------------------------------------------------------
+
+def _get(path: str, params: dict | None = None, cache_ttl: int | None = None) -> Any:
+    """
+    Perform a GET request against the OddsChecker mobile API.
+
+    path       - URL path relative to OC_API_BASE, e.g. "/v1/bets-search"
+    params     - query parameters dict
+    cache_ttl  - seconds to cache the response (None = no caching)
+
+    Returns the parsed JSON body, or None on failure.
+    """
+    _ensure_cache()
+
+    url = f"{OC_API_BASE}{path}"
+    cache_key = url + str(sorted((params or {}).items()))
+
+    if cache_ttl is not None:
+        cp = _cache_path(cache_key)
+        if _cache_valid(cp, cache_ttl):
+            logger.debug("Cache hit: %s", url)
+            return _read_cache(cp)
+
+    session = _make_session()
+    try:
+        logger.debug("GET %s params=%s", url, params)
+
+        # tls_client uses timeout_seconds, requests uses timeout.
+        get_kwargs = {
+            "headers": _base_headers(),
+            "params": params,
+        }
+
+        if tls_client and isinstance(session, tls_client.sessions.Session):
+            get_kwargs["timeout_seconds"] = REQUEST_TIMEOUT
+        else:
+            get_kwargs["timeout"] = REQUEST_TIMEOUT
+
+        resp = session.get(url, **get_kwargs)
+        logger.debug("Response %s from %s", resp.status_code, url)
+
+        if resp.status_code == 401:
+            logger.error(
+                "HTTP 401 from %s — the API may require an OC_API_KEY "
+                "or the TLS fingerprint was rejected.  "
+                "Set OC_API_KEY in your .env file if you have one.",
+                url,
+            )
+            return None
+
+        if resp.status_code == 403:
+            logger.error("HTTP 403 from %s — access forbidden", url)
+            return None
+
+        if resp.status_code != 200:
+            logger.error("HTTP %s from %s", resp.status_code, url)
+            return None
+
+        data = resp.json()
+
+        if cache_ttl is not None:
+            _write_cache(_cache_path(cache_key), data)
+
+        return data
+
+    except Exception as e:
+        logger.exception("Request failed for %s: %s", url, e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Public API functions
+# ---------------------------------------------------------------------------
+
+def get_boosts(
+    bet_type_ids: list[int] | None = None,
+    bookmaker_codes: list[str] | None = None,
+    category_group_ids: list[int] | None = None,
+    event_ids: list[str] | None = None,
+    subevent_ids: list[str] | None = None,
+    minimum_odds: float = DEFAULT_MINIMUM_ODDS,
+    offset: int = 0,
+    size: int = DEFAULT_PAGE_SIZE,
+    cache_ttl: int = CACHE_TTL_BOOSTS,
+) -> list[dict]:
+    """
+    Fetch boosted/enhanced-price bets from /v1/bets-search.
+
+    Parameters
+    ----------
+    bet_type_ids       - override the default boost bet-type IDs
+    bookmaker_codes    - list of bookmaker shortcodes to include
+    category_group_ids - sport category group IDs (2=football)
+    event_ids          - restrict to specific event IDs (empty = all)
+    subevent_ids       - restrict to specific subevent IDs (empty = all)
+    minimum_odds       - minimum decimal odds threshold
+    offset             - pagination offset
+    size               - page size
+    cache_ttl          - seconds to cache the response
+
+    Returns
+    -------
+    List of boost dicts (empty list on failure).
+    """
+    if bet_type_ids is None:
+        bet_type_ids = ALL_BOOST_BET_TYPE_IDS
+    if bookmaker_codes is None:
+        bookmaker_codes = DEFAULT_BOOKMAKER_CODES
+    if category_group_ids is None:
+        category_group_ids = [CATEGORY_GROUP_FOOTBALL]
+
+    params = {
+        "betTypeIds": ",".join(str(x) for x in bet_type_ids),
+        "bookmakerCodes": ",".join(bookmaker_codes),
+        "categoryGroupIds": ",".join(str(x) for x in category_group_ids),
+        "eventIDs": ",".join(str(x) for x in (event_ids or [])),
+        "subeventIds": ",".join(str(x) for x in (subevent_ids or [])),
+        "minimumOdds": str(minimum_odds),
+        "offset": str(offset),
+        "size": str(size),
+    }
+
+    data = _get("/v1/bets-search", params=params, cache_ttl=cache_ttl)
+    if data is None:
+        return []
+
+    # Normalise: the response may be a dict with a 'bets' key, or a list
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        # Common shapes: {"bets": [...]} or {"data": [...]} or {"results": [...]}
+        for key in ("bets", "data", "results", "items"):
+            if key in data and isinstance(data[key], list):
+                return data[key]
+        # If none of the above, return the whole dict wrapped in a list so
+        # callers always get a list
+        logger.debug("Unexpected bets-search response shape; keys=%s", list(data.keys()))
+        return [data]
+
+    return []
+
+
+def get_all_boosts_paginated(
+    bet_type_ids: list[int] | None = None,
+    bookmaker_codes: list[str] | None = None,
+    category_group_ids: list[int] | None = None,
+    minimum_odds: float = DEFAULT_MINIMUM_ODDS,
+    max_pages: int = 10,
+) -> list[dict]:
+    """
+    Fetch *all* boosted bets by walking through pages until exhausted.
+
+    Returns the combined list across all pages.
+    """
+    all_bets: list[dict] = []
+    for page in range(max_pages):
+        offset = page * DEFAULT_PAGE_SIZE
+        page_bets = get_boosts(
+            bet_type_ids=bet_type_ids,
+            bookmaker_codes=bookmaker_codes,
+            category_group_ids=category_group_ids,
+            minimum_odds=minimum_odds,
+            offset=offset,
+            size=DEFAULT_PAGE_SIZE,
+            cache_ttl=CACHE_TTL_BOOSTS,
+        )
+        if not page_bets:
+            break
+        all_bets.extend(page_bets)
+        if len(page_bets) < DEFAULT_PAGE_SIZE:
+            break  # last page
+
+    return all_bets
+
+
+def get_subevents_hierarchy(
+    bet_type_ids: list[int] | None = None,
+    bookmaker_codes: list[str] | None = None,
+    category_group_id: int = CATEGORY_GROUP_FOOTBALL,
+    event_ids: list[str] | None = None,
+    subevent_ids: list[str] | None = None,
+    cache_ttl: int = CACHE_TTL_BOOSTS,
+) -> dict | None:
+    """
+    Fetch the event / subevent hierarchy from /v1/subevents-hierarchy.
+    Useful for enriching boost data with full event names and metadata.
+
+    Returns the raw API dict, or None on failure.
+    """
+    if bet_type_ids is None:
+        bet_type_ids = ALL_BOOST_BET_TYPE_IDS
+    if bookmaker_codes is None:
+        bookmaker_codes = DEFAULT_BOOKMAKER_CODES
+
+    params = {
+        "betTypeIds": ",".join(str(x) for x in bet_type_ids),
+        "bookmakerCodes": ",".join(bookmaker_codes),
+        "categoryGroupId": str(category_group_id),
+        "eventIDs": ",".join(str(x) for x in (event_ids or [])),
+        "subeventIds": ",".join(str(x) for x in (subevent_ids or [])),
+    }
+
+    return _get("/v1/subevents-hierarchy", params=params, cache_ttl=cache_ttl)
+
+
+def get_categories(cache_ttl: int = 3600) -> list[dict]:
+    """Fetch all OddsChecker sport categories."""
+    data = _get("/v1/categories", cache_ttl=cache_ttl)
+    if data is None:
+        return []
+    if isinstance(data, list):
+        return data
+    for key in ("categories", "data", "results"):
+        if key in data and isinstance(data[key], list):
+            return data[key]
+    return []
+
+
+def get_bookmakers(cache_ttl: int = 3600) -> list[dict]:
+    """Fetch all bookmaker definitions from OddsChecker."""
+    data = _get("/v1/bookmakers", cache_ttl=cache_ttl)
+    if data is None:
+        return []
+    if isinstance(data, list):
+        return data
+    for key in ("bookmakers", "data", "results"):
+        if key in data and isinstance(data[key], list):
+            return data[key]
+    return []
+
+
+def get_big_football_matches(size: int = 10, cache_ttl: int = 300) -> list[dict]:
+    """Fetch upcoming high-profile football matches."""
+    data = _get("/football/v1/big-matches", params={"size": str(size)}, cache_ttl=cache_ttl)
+    if data is None:
+        return []
+    if isinstance(data, list):
+        return data
+    for key in ("matches", "events", "data", "results"):
+        if key in data and isinstance(data[key], list):
+            return data[key]
+    return []
+
+
+def get_horse_racing_next_off(
+    categories: str = "ukireland",
+    size: int = 10,
+    cache_ttl: int = 60,
+) -> list[dict]:
+    """Fetch next-off horse-racing events."""
+    params = {"categories": categories, "size": str(size)}
+    data = _get("/horse-racing/v3/next-off", params=params, cache_ttl=cache_ttl)
+    if data is None:
+        return []
+    if isinstance(data, list):
+        return data
+    for key in ("races", "events", "data", "results"):
+        if key in data and isinstance(data[key], list):
+            return data[key]
+    return []
+
+
+def get_most_backed_bets(
+    category_group_ids: list[int] | None = None,
+    category_ids: list[int] | None = None,
+    size: int = 20,
+    cache_ttl: int = 120,
+) -> list[dict]:
+    """Fetch most-backed bets across selected categories."""
+    params: dict[str, str] = {"size": str(size)}
+    if category_group_ids:
+        params["categoryGroupIds"] = ",".join(str(x) for x in category_group_ids)
+    if category_ids:
+        params["categoryIds"] = ",".join(str(x) for x in category_ids)
+
+    data = _get("/v1/most-backed-bets", params=params, cache_ttl=cache_ttl)
+    if data is None:
+        return []
+    if isinstance(data, list):
+        return data
+    for key in ("bets", "data", "results"):
+        if key in data and isinstance(data[key], list):
+            return data[key]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Boost enrichment helpers
+# ---------------------------------------------------------------------------
+
+def _bookie_name(code: str) -> str:
+    return BOOKMAKER_MAPPING.get(code, code)
+
+
+def enrich_boosts_with_hierarchy(
+    boosts: list[dict],
+    hierarchy: dict | list | None,
+) -> list[dict]:
+    """
+    Merge event/subevent display names from the subevents-hierarchy response
+    into each boost dict (in-place update, also returns the list).
+
+    The hierarchy payload structure is not fully known without a live response,
+    so this attempts common field paths and falls back gracefully.
+    """
+    if not hierarchy or not boosts:
+        return boosts
+
+    subevent_map: dict[str, dict] = {}
+
+    def _walk(node):
+        if isinstance(node, dict):
+            sid = node.get("subeventId") or node.get("id")
+            if sid is not None:
+                subevent_map[str(sid)] = node
+            for value in node.values():
+                _walk(value)
+
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(hierarchy)
+
+    for boost in boosts:
+        sid = str(boost.get("subeventId", ""))
+        if sid and sid in subevent_map:
+            se = subevent_map[sid]
+            boost.setdefault("eventName", se.get("name") or se.get("eventName", ""))
+            boost.setdefault("startTime", se.get("startTime") or se.get("startDate", ""))
+
+    return boosts
+
+
+def load_filters(filters_path: str = "filters.json") -> dict:
+    """Load filter definitions from a JSON file."""
+    if not os.path.isfile(filters_path):
+        return {}
+
+    try:
+        with open(filters_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+            logger.warning("Filters file %s is not a JSON object", filters_path)
+    except Exception as e:
+        logger.warning("Failed to load filters from %s: %s", filters_path, e)
+
+    return {}
+
+
+def _normalize(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip().lower()
+    return value
+
+
+def apply_filters(boosts: list[dict] | None, filters: dict) -> list[dict]:
+    """Apply sparse include filters to boost records."""
+    if not boosts:
+        return []
+
+    if not filters:
+        return boosts
+
+    normalized_filters = {}
+    for field, allowed in filters.items():
+        if isinstance(allowed, list):
+            normalized_filters[field] = {str(item).strip().lower() for item in allowed}
+        else:
+            normalized_filters[field] = {str(allowed).strip().lower()}
+
+    filtered: list[dict] = []
+    for boost in boosts:
+        keep = True
+        for field, allowed_set in normalized_filters.items():
+            value = _normalize(boost.get(field))
+            if value is None or value not in allowed_set:
+                keep = False
+                break
+
+        if keep:
+            filtered.append(boost)
+
+    return filtered
+    if not hierarchy or not boosts:
+        return boosts
+
+    # Build subevent lookup: subeventId -> subevent dict
+    subevent_map: dict[str, dict] = {}
+
+    def _walk(node):
+        """Recursively find subevent nodes."""
+        if isinstance(node, dict):
+            sid = node.get("subeventId") or node.get("id")
+            if sid:
+                subevent_map[str(sid)] = node
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(hierarchy)
+
+    for boost in boosts:
+        sid = str(boost.get("subeventId", ""))
+        if sid and sid in subevent_map:
+            se = subevent_map[sid]
+            boost.setdefault("eventName", se.get("name") or se.get("eventName", ""))
+            boost.setdefault("startTime", se.get("startTime") or se.get("startDate", ""))
+
+    return boosts
+
+
+# ---------------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------------
+
+def format_boost(boost: dict) -> str:
+    """
+    Return a human-readable single-line summary of a boost dict.
+
+    Handles unknown field names gracefully so the code keeps working even
+    when the actual API response has a different shape.
+    """
+    # Try several common field names for each piece of data
+    bookie_raw = boost.get("bookmakerCode") or boost.get("bookmaker") or boost.get("bookie") or "?"
+    bookie = _bookie_name(bookie_raw)
+
+    bet_name = (
+        boost.get("betName")
+        or boost.get("name")
+        or boost.get("selectionName")
+        or boost.get("outcome")
+        or "Unknown selection"
+    )
+
+    subevent = boost.get("subeventName") or boost.get("subevent") or ""
+    event = (
+        boost.get("eventName")
+        or boost.get("event")
+        or boost.get("matchName")
+        or ""
+    )
+
+    boosted = boost.get("boostedOdds") or boost.get("odds") or boost.get("oddsDecimal") or ""
+    original = boost.get("originalOdds") or boost.get("referenceOdds") or ""
+
+    odds_str = str(boosted)
+    if original:
+        odds_str += f" (was {original})"
+
+    market = (
+        boost.get("betTypeName")
+        or boost.get("marketName")
+        or boost.get("betType")
+        or ""
+    )
+
+    parts = [f"[{bookie}]"]
+    if subevent:
+        parts.append(subevent)
+    if event and event != subevent:
+        parts.append(f"({event})")
+    if market:
+        parts.append(f"| {market}")
+    parts.append(f"| {bet_name}")
+    if odds_str:
+        parts.append(f"@ {odds_str}")
+
+    return "  ".join(parts)
+
+
+def format_boosts(boosts: list[dict]) -> str:
+    """Format a list of boosts as a multi-line string."""
+    if not boosts:
+        return "  (no boosts found)"
+    lines = [format_boost(b) for b in boosts]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Polling loop
+# ---------------------------------------------------------------------------
+
+def run_boost_loop(
+    poll_interval: int = 60,
+    bet_type_ids: list[int] | None = None,
+    bookmaker_codes: list[str] | None = None,
+    category_group_ids: list[int] | None = None,
+    minimum_odds: float = DEFAULT_MINIMUM_ODDS,
+    include_hierarchy: bool = True,
+    sport: str = "football",
+) -> None:
+    """
+    Continuously poll OddsChecker for boosted bets and print new ones.
+
+    poll_interval  - seconds between refreshes
+    sport          - "football" or "horse_racing" (affects which bet-type IDs
+                     and category groups are used by default)
+    """
+    if sport == "horse_racing":
+        from config import BOOST_BET_TYPE_IDS_RACING, CATEGORY_GROUP_HORSE_RACING
+        bet_type_ids = bet_type_ids or BOOST_BET_TYPE_IDS_RACING
+        category_group_ids = category_group_ids or [CATEGORY_GROUP_HORSE_RACING]
+    else:
+        bet_type_ids = bet_type_ids or BOOST_BET_TYPE_IDS_FOOTBALL
+        category_group_ids = category_group_ids or [CATEGORY_GROUP_FOOTBALL]
+
+    seen_ids: set[str] = set()
+    logger.info("Starting boost loop (sport=%s, interval=%ds)", sport, poll_interval)
+
+    while True:
+        try:
+            boosts = get_all_boosts_paginated(
+                bet_type_ids=bet_type_ids,
+                bookmaker_codes=bookmaker_codes,
+                category_group_ids=category_group_ids,
+                minimum_odds=minimum_odds,
+            )
+
+            if include_hierarchy and boosts:
+                hierarchy = get_subevents_hierarchy(
+                    bet_type_ids=bet_type_ids,
+                    bookmaker_codes=bookmaker_codes,
+                    category_group_id=category_group_ids[0],
+                )
+                boosts = enrich_boosts_with_hierarchy(boosts, hierarchy)
+
+            # Identify new boosts by a composite key
+            new_boosts = []
+            for b in boosts:
+                bid = (
+                    str(b.get("id") or "")
+                    + str(b.get("betId") or "")
+                    + str(b.get("bookmakerCode") or b.get("bookie") or "")
+                    + str(b.get("boostedOdds") or b.get("odds") or "")
+                )
+                if bid not in seen_ids:
+                    seen_ids.add(bid)
+                    new_boosts.append(b)
+
+            if new_boosts:
+                print(f"\n{'='*60}")
+                print(f"  {len(new_boosts)} new boost(s) — {_now()}")
+                print(f"{'='*60}")
+                print(format_boosts(new_boosts))
+            else:
+                print(f"[{_now()}] No new boosts (total fetched: {len(boosts)})")
+
+        except KeyboardInterrupt:
+            logger.info("Boost loop stopped by user.")
+            break
+        except Exception as e:
+            logger.exception("Error in boost loop: %s", e)
+
+        time.sleep(poll_interval)
+
+
+def _now() -> str:
+    import datetime
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")

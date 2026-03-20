@@ -1,0 +1,296 @@
+"""
+main.py
+=======
+Entry point for the OddsChecker Boosts scraper.
+
+Usage
+-----
+  # One-shot fetch of all current football boosts
+  python main.py
+
+  # Continuous polling every 30 seconds
+  python main.py --loop --interval 30
+
+  # Horse-racing boosts only
+  python main.py --sport horse_racing
+
+  # Football, specific bookmakers, minimum odds 2.0
+  python main.py --bookmakers B3,PP,WH --min-odds 2.0
+
+  # Dump raw JSON to a file
+  python main.py --output boosts.json
+
+  # Explore discovery endpoints (categories, bookmakers, big matches)
+  python main.py --discover
+
+Environment variables (see .env.example)
+-----------------------------------------
+  OC_API_KEY   - optional API key forwarded as X-Api-Key header
+  LOG_LEVEL    - DEBUG / INFO / WARNING (default INFO)
+  DEBUG_MODE   - set to "1" for verbose scraper debug output
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+# Load .env if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+from logging_config import get_logger
+from boosts_scraper import (
+    apply_filters,
+    format_boosts,
+    get_all_boosts_paginated,
+    get_big_football_matches,
+    get_bookmakers,
+    get_boosts,
+    get_categories,
+    get_horse_racing_next_off,
+    get_most_backed_bets,
+    get_subevents_hierarchy,
+    enrich_boosts_with_hierarchy,
+    load_filters,
+    run_boost_loop,
+)
+from config import (
+    ALL_BOOST_BET_TYPE_IDS,
+    BOOST_BET_TYPE_IDS_FOOTBALL,
+    BOOST_BET_TYPE_IDS_RACING,
+    CATEGORY_GROUP_FOOTBALL,
+    CATEGORY_GROUP_HORSE_RACING,
+    DEFAULT_BOOKMAKER_CODES,
+    DEFAULT_MINIMUM_ODDS,
+)
+
+logger = get_logger("main")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Scrape OddsChecker for betting boosts / enhanced prices.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument(
+        "--sport",
+        choices=["football", "horse_racing", "all"],
+        default="football",
+        help="Which sport to fetch boosts for.",
+    )
+    p.add_argument(
+        "--bookmakers",
+        default=",".join(DEFAULT_BOOKMAKER_CODES),
+        help="Comma-separated bookmaker shortcodes, e.g. B3,PP,WH",
+    )
+    p.add_argument(
+        "--min-odds",
+        type=float,
+        default=DEFAULT_MINIMUM_ODDS,
+        dest="min_odds",
+        help="Minimum decimal odds to include.",
+    )
+    p.add_argument(
+        "--size",
+        type=int,
+        default=50,
+        help="Results per API page.",
+    )
+    p.add_argument(
+        "--loop",
+        action="store_true",
+        help="Run in continuous polling mode.",
+    )
+    p.add_argument(
+        "--interval",
+        type=int,
+        default=60,
+        help="Poll interval in seconds (only with --loop).",
+    )
+    p.add_argument(
+        "--output",
+        metavar="FILE",
+        default=None,
+        help="Save raw boost JSON to this file.",
+    )
+    p.add_argument(
+        "--discover",
+        action="store_true",
+        help="Fetch and display discovery endpoints (categories, bookmakers, big matches…).",
+    )
+    p.add_argument(
+        "--no-hierarchy",
+        action="store_true",
+        dest="no_hierarchy",
+        help="Skip the subevents-hierarchy call (faster, less event info).",
+    )
+    p.add_argument(
+        "--raw",
+        action="store_true",
+        help="Print raw JSON instead of formatted output.",
+    )
+    p.add_argument(
+        "--output-txt",
+        metavar="FILE",
+        default=None,
+        help="Save formatted boost list to a plaintext file.",
+    )
+    p.add_argument(
+        "--filters",
+        metavar="FILE",
+        default="filters.json",
+        help="Load JSON filters from this file and apply to output.",
+    )
+    return p.parse_args()
+
+
+def _bet_type_ids(sport: str) -> list[int]:
+    if sport == "football":
+        return BOOST_BET_TYPE_IDS_FOOTBALL
+    if sport == "horse_racing":
+        return BOOST_BET_TYPE_IDS_RACING
+    return ALL_BOOST_BET_TYPE_IDS
+
+
+def _category_groups(sport: str) -> list[int]:
+    if sport == "football":
+        return [CATEGORY_GROUP_FOOTBALL]
+    if sport == "horse_racing":
+        return [CATEGORY_GROUP_HORSE_RACING]
+    return [CATEGORY_GROUP_FOOTBALL, CATEGORY_GROUP_HORSE_RACING]
+
+
+def run_discover() -> None:
+    """Fetch and print discovery endpoint data."""
+    print("\n" + "=" * 60)
+    print("  DISCOVERY MODE")
+    print("=" * 60)
+
+    print("\n--- Categories ---")
+    cats = get_categories()
+    if cats:
+        for c in cats[:20]:
+            print(f"  {c}")
+    else:
+        print("  (none returned / check auth)")
+
+    print("\n--- Bookmakers ---")
+    bkms = get_bookmakers()
+    if bkms:
+        for b in bkms[:20]:
+            print(f"  {b}")
+    else:
+        print("  (none returned / check auth)")
+
+    print("\n--- Big Football Matches ---")
+    matches = get_big_football_matches(size=5)
+    if matches:
+        for m in matches:
+            print(f"  {m}")
+    else:
+        print("  (none returned / check auth)")
+
+    print("\n--- Horse Racing Next Off ---")
+    races = get_horse_racing_next_off(size=5)
+    if races:
+        for r in races:
+            print(f"  {r}")
+    else:
+        print("  (none returned / check auth)")
+
+    print("\n--- Most Backed Bets (football) ---")
+    backed = get_most_backed_bets(category_group_ids=[CATEGORY_GROUP_FOOTBALL], size=5)
+    if backed:
+        for b in backed:
+            print(f"  {b}")
+    else:
+        print("  (none returned / check auth)")
+
+
+def run_once(args: argparse.Namespace) -> None:
+    """Fetch boosts once and display / save."""
+    bookmaker_codes = [c.strip() for c in args.bookmakers.split(",") if c.strip()]
+    bet_type_ids = _bet_type_ids(args.sport)
+    category_groups = _category_groups(args.sport)
+
+    print(f"\nFetching boosts: sport={args.sport}, bookmakers={bookmaker_codes}, "
+          f"min_odds={args.min_odds}")
+
+    boosts = get_all_boosts_paginated(
+        bet_type_ids=bet_type_ids,
+        bookmaker_codes=bookmaker_codes,
+        category_group_ids=category_groups,
+        minimum_odds=args.min_odds,
+    )
+
+    filters = load_filters(args.filters) if args.filters else {}
+
+    if not args.no_hierarchy and boosts:
+        print("Fetching subevents hierarchy for enrichment…")
+        hierarchy = get_subevents_hierarchy(
+            bet_type_ids=bet_type_ids,
+            bookmaker_codes=bookmaker_codes,
+            category_group_id=category_groups[0],
+        )
+        boosts = enrich_boosts_with_hierarchy(boosts, hierarchy)
+
+    if boosts is None:
+        boosts = []
+
+    if filters:
+        boosts = apply_filters(boosts, filters)
+
+    print(f"\nFound {len(boosts)} boost(s).\n")
+
+    if args.raw:
+        print(json.dumps(boosts, indent=2, ensure_ascii=False))
+    else:
+        print(format_boosts(boosts))
+
+    if args.output:
+        try:
+            with open(args.output, "w", encoding="utf-8") as f:
+                json.dump(boosts, f, indent=2, ensure_ascii=False)
+            print(f"\nRaw JSON saved to {args.output}")
+        except Exception as e:
+            logger.error("Failed to save output: %s", e)
+
+    if args.output_txt:
+        try:
+            formatted = format_boosts(boosts)
+            with open(args.output_txt, "w", encoding="utf-8") as f:
+                f.write(formatted)
+            print(f"\nFormatted text saved to {args.output_txt}")
+        except Exception as e:
+            logger.error("Failed to save text output: %s", e)
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.discover:
+        run_discover()
+        return
+
+    if args.loop:
+        run_boost_loop(
+            poll_interval=args.interval,
+            bet_type_ids=_bet_type_ids(args.sport),
+            bookmaker_codes=[c.strip() for c in args.bookmakers.split(",") if c.strip()],
+            category_group_ids=_category_groups(args.sport),
+            minimum_odds=args.min_odds,
+            include_hierarchy=not args.no_hierarchy,
+            sport=args.sport,
+        )
+    else:
+        run_once(args)
+
+
+if __name__ == "__main__":
+    main()
