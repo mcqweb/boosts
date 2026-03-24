@@ -126,6 +126,25 @@ def _minutes_until(start_time_str: str) -> float | None:
         return None
 
 
+def _wh_event_url(bookmaker: dict) -> str | None:
+    """Return William Hill event URL when possible."""
+    code = (bookmaker.get("bookmakerCode") or "").strip().upper()
+    name = (bookmaker.get("bookmakerName") or "").strip().lower()
+
+    if code != "WH" and "william hill" not in name:
+        return None
+
+    bookmaker_bet_id = bookmaker.get("bookmakerBetId") or ""
+    if not isinstance(bookmaker_bet_id, str) or "*" not in bookmaker_bet_id:
+        return None
+
+    event_id = bookmaker_bet_id.strip().split("*")[-1]
+    if not event_id:
+        return None
+
+    return f"https://sports.williamhill.com/betting/en-gb/football/{event_id}"
+
+
 def _boost_lines(boost: dict) -> str:
     """One or more text lines for a single boost: name + bookmaker odds."""
     name = boost.get("name", "Unknown")
@@ -138,7 +157,14 @@ def _boost_lines(boost: dict) -> str:
         for b in bookmakers:
             dec = b.get("oddsDecimal") or "—"
             bname = b.get("bookmakerName") or b.get("bookmakerCode") or ""
-            parts.append(f"\u00a0\u00a0{dec} @ {bname}")
+            url = _wh_event_url(b)
+            text = f"{dec} @ {bname}"
+
+            if url:
+                parts.append(f"\u00a0\u00a0[{text}]({url})")
+            else:
+                parts.append(f"\u00a0\u00a0{text}")
+
     return "\n".join(parts)
 
 

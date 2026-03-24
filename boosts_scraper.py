@@ -57,6 +57,7 @@ from config import (
     DEFAULT_PAGE_SIZE,
     OC_API_BASE,
     OC_API_KEY,
+    ODDSMATCHA_API_KEY,
     REQUEST_TIMEOUT,
 )
 from logging_config import get_logger
@@ -498,8 +499,19 @@ def get_exchange_data(
     timeout_seconds: int = 30,
 ) -> list[dict]:
     """Fetch enhanced exchange specials from oddsmatcha."""
+    headers = {}
+    if ODDSMATCHA_API_KEY:
+        headers["X-API-Key"] = ODDSMATCHA_API_KEY
+    else:
+        logger.warning("ODDSMATCHA_API_KEY is not set; oddsmatcha requests may be rejected")
+
     try:
-        resp = requests.get(url, timeout=timeout_seconds, proxies=_PROXIES or None)
+        resp = requests.get(
+            url,
+            timeout=timeout_seconds,
+            proxies=_PROXIES or None,
+            headers=headers or None,
+        )
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, list):

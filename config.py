@@ -5,6 +5,7 @@ All tuneable parameters live here so the rest of the code stays clean.
 Override values via environment variables where noted.
 """
 
+import json
 import os
 
 # ---------------------------------------------------------------------------
@@ -20,6 +21,30 @@ OC_API_BASE = "https://api.oddschecker.com/api/mobile-app"
 # present.
 # ---------------------------------------------------------------------------
 OC_API_KEY = os.getenv("OC_API_KEY") or "a1d4634b-6cd8-4485-a7cd-c9b91f38177f"
+
+
+def _load_oddsmatcha_api_key() -> str:
+    """Read oddsmatcha API key from environment or config.json."""
+    key = os.getenv("ODDSMATCHA_API_KEY", "").strip()
+    if key:
+        return key
+
+    config_path = os.getenv("CONFIG_PATH", "config.json")
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            oddsmatcha_cfg = data.get("oddsmatcha") or {}
+            key = (oddsmatcha_cfg.get("api_key") or "").strip()
+            if key:
+                return key
+        except Exception:
+            pass
+
+    return ""
+
+
+ODDSMATCHA_API_KEY = _load_oddsmatcha_api_key()
 
 # ---------------------------------------------------------------------------
 # Bet-type IDs for "boosted" / "enhanced-price" markets

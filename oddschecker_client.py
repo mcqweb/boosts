@@ -33,6 +33,7 @@ try:
 except ImportError:
     BeautifulSoup = None
 
+from config import ODDSMATCHA_API_KEY
 from logging_config import get_logger
 
 logger = get_logger("oddschecker_client")
@@ -256,7 +257,13 @@ def prefetch_oddschecker_slugs(betfair_ids: list) -> dict:
 
     try:
         _debug(f"[INFO] Prefetching slugs for {len(uncached)} Betfair IDs…")
-        r = requests.get(url, proxies=_OC_PROXIES, timeout=30)
+        headers = {}
+        if ODDSMATCHA_API_KEY:
+            headers["X-API-Key"] = ODDSMATCHA_API_KEY
+        else:
+            logger.warning("ODDSMATCHA_API_KEY is not set; oddsmatcha slug conversion may be rejected")
+
+        r = requests.get(url, proxies=_OC_PROXIES, timeout=30, headers=headers or None)
         print(f"[OC] Slug API status: {r.status_code}")
         if r.status_code != 200:
             logger.warning("Slug API returned %s", r.status_code)
@@ -293,7 +300,13 @@ def get_oddschecker_match_slug(betfair_id) -> str | None:
 
     url = f"https://api.oddsmatcha.uk/convert/betfair_to_oddschecker?betfair_ids={betfair_id}"
     try:
-        r = requests.get(url, proxies=_OC_PROXIES, timeout=10)
+        headers = {}
+        if ODDSMATCHA_API_KEY:
+            headers["X-API-Key"] = ODDSMATCHA_API_KEY
+        else:
+            logger.warning("ODDSMATCHA_API_KEY is not set; oddsmatcha slug conversion may be rejected")
+
+        r = requests.get(url, proxies=_OC_PROXIES, timeout=10, headers=headers or None)
         data = r.json()
         if data.get("success") and isinstance(data.get("conversions"), list):
             convs = data["conversions"]
